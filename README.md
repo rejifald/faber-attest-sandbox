@@ -13,3 +13,5 @@ The releases here are test fixtures. The repository will be deleted when the
 test is over.
 
 Releases v0.0.1 and v0.0.2 exist so replay tests have an older genuine build.
+
+This line exists only on the spike/branch-build branch.
