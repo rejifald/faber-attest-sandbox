@@ -1,0 +1,56 @@
+name: Proof 7
+
+# Test harness, not part of the release design. It tries, with the workflow's
+# own GITHUB_TOKEN (contents: write), the things only the owner should be able
+# to do, and prints GitHub's exact responses. Every attempt is expected to fail.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag for the token-made draft (must match v*)"
+        required: true
+      tag_exists:
+        description: "The owner created this tag beforehand (case b)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  attempt:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Show whether the tag exists before anything
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -i 2>&1 | sed -n '1p;/^{/p' || true
+
+      - name: Token creates a draft on the tag
+        id: draft
+        run: |
+          set -euo pipefail
+          body=$(jq -n --arg t "$TAG" --arg c "$GITHUB_SHA" \
+            '{tag_name:$t, target_commitish:$c, name:("proof7 " + $t), body:"proof 7 test fixture", draft:true}')
+          resp=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" --input - <<<"$body")
+          echo "$resp" | jq '{id, tag_name, draft, target_commitish}'
+          echo "id=$(echo "$resp" | jq .id)" >> "$GITHUB_OUTPUT"
+
+      - name: Token tries to PUBLISH the draft (PATCH draft=false)
+        run: |
+          echo "--- PATCH releases/${{ steps.draft.outputs.id }} {draft:false}"
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.id }}" \
+            -F draft=false -i 2>&1 | sed -n '1p;/^{/,$p' || true
+          echo "--- state after the attempt"
+          gh api "repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.id }}" \
+            --jq '{id, tag_name, draft, published_at, immutable}' || true
+          echo "--- tag after the attempt"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -i 2>&1 | sed -n '1p;/^{/p' || true
+
+      - name: Token tries to create a v* tag ref directly
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/${TAG}-direct" -f sha="$GITHUB_SHA" -i 2>&1 | sed -n '1p;/^{/,$p' || true

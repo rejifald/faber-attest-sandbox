@@ -1,0 +1,9 @@
+[package]
+name = "hello-sandbox"
+# Placeholder. The release workflow stamps the real version into its own
+# checkout; nothing is committed back.
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
