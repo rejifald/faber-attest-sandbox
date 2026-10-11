@@ -1,13 +1,51 @@
 name: Release
 
-# Run by hand only: Actions -> Release -> Run workflow on main. Nothing fires on
-# a push or a merge. The run ends in a DRAFT release whose tag does not exist
-# yet; publishing it (which creates the tag) is the owner's act.
+# SANDBOX PORT. This is faber's release.yml (ADR-0031, faber#127) with only the
+# build of the program swapped: it builds the stand-in in this repository's
+# src/, not faber. Changes from the original, each marked "SANDBOX:" below:
+#   - Rust comes from the runner's preinstalled rustup, because this repository
+#     allows GitHub-owned actions only (the original uses dtolnay/rust-toolchain)
+#   - only Cargo.toml and Cargo.lock are stamped (there is no desktop/ app)
+#   - the policy check asserts the stand-in's `policy: stand-in`
+#   - the "app" asset is a tarball with a VERSION file and deliberately no
+#     faber.app, so a follower's app refresh can never replace an installed app
+#   - draft titles say "stand-in"
+# The job and permission layout, the SHA pins, the ref guards, the no-cache
+# rule, the version computation and the draft flow are unchanged.
+#
+# ADR-0031's release flow. A release is two deliberate acts by the owner:
+#
+#   1. Actions -> Release -> Run workflow, on `main`, choosing patch/minor/major.
+#      This workflow builds every target, checksums and attests the assets, and
+#      leaves exactly one DRAFT release whose tag does not exist yet.
+#   2. Releases -> Publish, with the draft and its notes in view. Publishing is
+#      what creates the `v*` tag, and only the owner may do it.
+#
+# Nothing here fires on a push, a tag or a merge: an auto-updating fleet must
+# never be able to acquire a new version by accident (ADR-0006).
+#
+# Job layout, and why it is split this way:
+#
+#   plan    contents: read   refuse any ref but main; compute the version; notes
+#   build   contents: read   stamp the version, build, check `--version` exactly
+#   attest  id-token/attest  checksum the assets, sign SHA256SUMS keylessly
+#   draft   contents: write  gh CLI only: delete older drafts, create the draft
+#
+# Only `draft` can write to the repository, and it runs no action at all, first-
+# or third-party: nothing it executes is code fetched at run time. The attest
+# step lives in this file on purpose: a follower's policy pins the signer
+# workflow to `release.yml@refs/heads/main`, so moving the step (into a reusable
+# workflow, say) is a trust-root change, not a refactor.
+#
+# Every `uses:` is pinned to a full commit SHA, with the release it was in as a
+# comment. No cache is restored anywhere: every workflow on `main` shares
+# `main`'s caches, so code running in any of them could plant an entry this
+# release would then build from and attest as genuine.
 on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Which part of the version to bump"
+        description: "Which part of the last published version to bump"
         type: choice
         options: [patch, minor, major]
         default: patch
@@ -15,60 +53,129 @@ on:
 # Nothing by default. Each job asks for exactly what it needs.
 permissions: {}
 
+# One release run at a time: two concurrent dispatches would each delete the
+# other's draft.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   plan:
+    name: plan
     runs-on: ubuntu-latest
     permissions:
-      contents: write # list and delete draft releases (drafts are visible only with push access)
+      contents: read
     outputs:
-      version: ${{ steps.v.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Compute the next version from the last published release
-        id: v
+      # First, before anything is checked out, built or deleted. A branch run
+      # must not be able to delete `main`'s draft, and a follower would refuse
+      # its attestation anyway (the policy pins refs/heads/main).
+      - name: Refuse any ref but main
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Release runs only on refs/heads/main, not $GITHUB_REF. Nothing was built or deleted."
+            exit 1
+          fi
+          echo "ref: $GITHUB_REF at $GITHUB_SHA"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # notes are a log range against the last published tag
+          persist-credentials: false
+
+      # From the last *published*, non-pre-release release: a draft is not
+      # something any host has seen, and a tag without a release (the archive's
+      # v0.3.12) is not something any host upgraded from. Highest version, not
+      # GitHub's "latest" flag, which a token can move (ADR-0031, What the spikes
+      # found).
+      #
+      # Cargo.toml's committed version is a floor, not the release version: the
+      # next release is a bump of whichever is higher. It is what makes the first
+      # release of a fresh repository (no published release at all) start above
+      # every version the archive ever tagged, so no host compares against a
+      # version that went backwards.
+      - name: Compute the next version
+        id: version
         env:
           GH_TOKEN: ${{ github.token }}
           BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
+          semver='^[0-9]+\.[0-9]+\.[0-9]+$'
           LAST="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
             --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
             | sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' | sort -V | tail -n1)"
-          LAST="${LAST:-0.0.0}"
-          IFS=. read -r MA MI PA <<<"$LAST"
+          FLOOR="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]*)".*/\1/')"
+          [[ "$FLOOR" =~ $semver ]] || { echo "::error::Cargo.toml's version '$FLOOR' is not x.y.z"; exit 1; }
+          BASE="$(printf '%s\n%s\n' "${LAST:-0.0.0}" "$FLOOR" | sort -V | tail -n1)"
+          IFS=. read -r MA MI PA <<<"$BASE"
           case "$BUMP" in
-            major) MA=$((MA+1)); MI=0; PA=0 ;;
-            minor) MI=$((MI+1)); PA=0 ;;
-            patch) PA=$((PA+1)) ;;
+            major) MA=$((10#$MA + 1)); MI=0; PA=0 ;;
+            minor) MI=$((10#$MI + 1)); PA=0 ;;
+            patch) PA=$((10#$PA + 1)) ;;
+            *) echo "::error::unknown bump '$BUMP'"; exit 1 ;;
           esac
-          echo "last published: $LAST -> next: $MA.$MI.$PA"
-          echo "version=$MA.$MI.$PA" >> "$GITHUB_OUTPUT"
+          NEXT="$((10#$MA)).$((10#$MI)).$((10#$PA))"
+          echo "last published: ${LAST:-none}, floor: $FLOOR -> next: $NEXT"
 
-      - name: Delete older drafts, so only one candidate exists
+          # A tag that already exists would turn into a release the moment its
+          # draft is published, whatever commit it points at. Only Publish
+          # creates a `v*` tag, so an existing one is an anomaly to look at.
+          if git rev-parse -q --verify "refs/tags/v$NEXT" >/dev/null; then
+            echo "::error::tag v$NEXT already exists without a published release; investigate it before releasing."
+            exit 1
+          fi
+
+          {
+            echo "version=$NEXT"
+            echo "last=$LAST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assemble release notes
         env:
-          GH_TOKEN: ${{ github.token }}
+          LAST: ${{ steps.version.outputs.last }}
         run: |
           set -euo pipefail
-          for id in $(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq '.[] | select(.draft) | .id'); do
-            echo "deleting draft $id"
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
-          done
+          mkdir -p notes
+          if [[ -n "$LAST" ]] && git rev-parse -q --verify "refs/tags/v$LAST" >/dev/null; then
+            git log "v$LAST..$GITHUB_SHA" --pretty=format:'- %s' > notes/NOTES.md
+          fi
+          [[ -s notes/NOTES.md ]] || printf 'First tracked release.\n' > notes/NOTES.md
+          cat notes/NOTES.md
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notes
+          path: notes/
+          if-no-files-found: error
+          retention-days: 7
 
   build:
+    name: build · ${{ matrix.target }}
     needs: plan
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     strategy:
+      # A partial matrix must never become a release. `draft` needs this whole
+      # job, so one failed target already blocks it; fail-fast just stops the
+      # others wasting runner minutes once that is decided.
       fail-fast: true
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+            # Only macOS has a menu-bar app bundle to ship. src/update.rs treats
+            # the app asset as optional off macOS for exactly this reason.
+            app: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
     env:
       VERSION: ${{ needs.plan.outputs.version }}
     steps:
@@ -76,51 +183,130 @@ jobs:
         with:
           persist-credentials: false
 
-      # Into this checkout only; nothing is committed.
+      # SANDBOX: the runner's own rustup instead of dtolnay/rust-toolchain, which
+      # this repository's allowed-actions setting (GitHub-owned only) refuses.
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      # Into this checkout only; nothing is committed. Every manifest that
+      # records the version is stamped, and both lockfiles with it, because
+      # `--locked` refuses a lockfile that disagrees with its manifest. Each
+      # edit must change exactly one line, or the run stops here.
       - name: Stamp the version
         shell: bash
         run: |
           set -euo pipefail
-          # First `version =` line only (the [package] one); portable across runners.
-          perl -pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/ if !$done && /^version = / && ($done = 1)' Cargo.toml
-          grep '^version' Cargo.toml
+          stamp() { # file perl-substitution
+            perl -0pi -e "$2" "$1"
+            local changed; changed="$(git diff --numstat -- "$1" | cut -f1,2)"
+            [[ "$changed" == "1"$'\t'"1" ]] \
+              || { echo "::error::stamping $1 changed '${changed:-nothing}' (+/-), expected exactly one line"; exit 1; }
+            echo "stamped $1"
+          }
+          stamp Cargo.toml                      's/^version = "[^"]*"/version = "$ENV{VERSION}"/m'
+          stamp Cargo.lock                      's/(\nname = "faber"\nversion = ")[^"]*"/$1$ENV{VERSION}"/'
+          # SANDBOX: no desktop/ manifests to stamp.
+          git diff --stat
 
-      # No cache restore, deliberately: a branch's caches are writable by any
-      # workflow on that branch.
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build the daemon
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Check the binary reports exactly the stamped version
+      # Every runner in this matrix is native to the target it builds, so the
+      # binary can be executed here. That is the only thing standing between a
+      # stale or mis-stamped build and an auto-updating fleet installing it. If
+      # a cross-compiled target is ever added it cannot run this step, and that
+      # gap should be argued for explicitly rather than discovered.
+      #
+      # Exact, not a substring: `faber <version>+g<sha>`, the version equal to
+      # the stamped one and the build suffix a prefix of the built commit. That
+      # is the same binding a follower checks (ADR-0031, What a follower
+      # verifies, step 3).
+      - name: Check the binary reports exactly this version and commit
         shell: bash
         run: |
           set -euo pipefail
-          BUILT="$("target/${{ matrix.target }}/release/hello-sandbox" --version)"
-          WANT="hello-sandbox $VERSION"
-          echo "built: '$BUILT' want: '$WANT'"
-          [[ "$BUILT" == "$WANT" ]] || { echo "version mismatch" >&2; exit 1; }
+          BIN="target/${{ matrix.target }}/release/faber"
+          test -x "$BIN" || { echo "::error::no binary at $BIN"; exit 1; }
+          BUILT="$("$BIN" --version)"
+          echo "built: '$BUILT'  want: 'faber $VERSION+g<prefix of $GITHUB_SHA>'"
+          [[ "$BUILT" =~ ^faber\ ([0-9]+\.[0-9]+\.[0-9]+)\+g([0-9a-f]{7,40})$ ]] \
+            || { echo "::error::'$BUILT' is not 'faber <x.y.z>+g<sha>'"; exit 1; }
+          [[ "${BASH_REMATCH[1]}" == "$VERSION" ]] \
+            || { echo "::error::binary reports ${BASH_REMATCH[1]}, not $VERSION"; exit 1; }
+          [[ "$GITHUB_SHA" == "${BASH_REMATCH[2]}"* ]] \
+            || { echo "::error::binary was built from ${BASH_REMATCH[2]}, not $GITHUB_SHA"; exit 1; }
+          echo "version and commit match"
 
-      - name: Stage
+      # The verification policy is compiled in (ADR-0031). The `sandbox-policy`
+      # feature swaps in the throwaway sandbox repository's, for tests only; a
+      # binary built with it would make every follower trust that repository. The
+      # binary is asked, rather than the build command read, so a feature turned
+      # on any other way (a default, a dependency) is caught too.
+      - name: Check the binary enforces the release verification policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/faber"
+          POLICY="$("$BIN" provenance-policy)"
+          echo "$POLICY"
+          # SANDBOX: the stand-in has no verifier, so it prints `policy: stand-in`
+          # and the guard asserts exactly that (the original asserts
+          # `policy: release` and no placeholder repository ID).
+          [[ "$(head -n1 <<<"$POLICY")" == "policy: stand-in" ]] \
+            || { echo "::error::binary reports '$(head -n1 <<<"$POLICY")', not the stand-in policy"; exit 1; }
+          echo "stand-in policy line present"
+
+      - name: Stage the daemon under the name followers match on
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/hello-sandbox" "dist/hello-sandbox-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/faber" "dist/faber-${{ matrix.target }}"
+          chmod 0755 "dist/faber-${{ matrix.target }}"
+
+      # SANDBOX: in place of the menu-bar app, a tarball under the same asset
+      # name holding only a VERSION file. It deliberately contains no
+      # `faber.app`: a follower that installs this release then fails its
+      # best-effort app refresh before touching any installed app.
+      - name: Build and stage the stand-in app tarball
+        if: matrix.app
+        shell: bash
+        run: |
+          set -euo pipefail
+          PARENT="$RUNNER_TEMP/standin-app"
+          mkdir -p "$PARENT/standin-app"
+          printf '%s\n' "$VERSION" > "$PARENT/standin-app/VERSION"
+          APP_VERSION="$(cat "$PARENT/standin-app/VERSION")"
+          [[ "$APP_VERSION" == "$VERSION" ]] \
+            || { echo "::error::app tarball reports $APP_VERSION, not $VERSION"; exit 1; }
+          tar -czf "dist/faber-app-${{ matrix.target }}.tar.gz" -C "$PARENT" standin-app
+          tar -tzf "dist/faber-app-${{ matrix.target }}.tar.gz"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
 
-  draft:
-    needs: [plan, build]
+  attest:
+    name: attest
+    needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the draft release
-      id-token: write # Sigstore keyless signing via this workflow's OIDC identity
-      attestations: write # persist the attestation
-    env:
-      VERSION: ${{ needs.plan.outputs.version }}
+      contents: read
+      id-token: write # Sigstore keyless signing, via this workflow run's OIDC identity
+      attestations: write # persist the attestation against SHA256SUMS's digest
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -128,33 +314,122 @@ jobs:
           pattern: dist-*
           merge-multiple: true
 
-      - name: Checksum
+      # Bare filenames, no directory component: a follower matches SHA256SUMS
+      # entries against bare asset names (src/update.rs::parse_sha256sums).
+      - name: Checksum every asset
         working-directory: staged
         run: |
-          sha256sum hello-sandbox-* > SHA256SUMS
+          set -euo pipefail
+          ls -la
+          sha256sum faber-* > SHA256SUMS
           cat SHA256SUMS
-          sha256sum SHA256SUMS
+          mkdir -p ../attested
+          cp SHA256SUMS ../attested/
 
+      # The one signature a release carries (ADR-0031). Its subject is
+      # SHA256SUMS, which in turn binds every asset. No `continue-on-error`:
+      # an unsigned release is one no follower will install, so failing here
+      # is the right outcome. (A private repository cannot persist
+      # attestations at all, which is why this workflow is only ever run in
+      # the public one.)
       - name: Attest SHA256SUMS
         id: attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: staged/SHA256SUMS
+          subject-path: attested/SHA256SUMS
 
-      - name: Create the draft (the tag is not created)
+      # Shipped as a release asset so verifying a release needs only the
+      # release, never GitHub's attestations API.
+      - name: Stage the bundle
         env:
-          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
         run: |
           set -euo pipefail
+          test -s "$BUNDLE" || { echo "::error::no attestation bundle at '$BUNDLE'"; exit 1; }
+          cp "$BUNDLE" attested/SHA256SUMS.sigstore.json
+          ls -la attested
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: attested
+          path: attested/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that can write to the repository. It runs the preinstalled gh
+  # CLI and nothing else: no checkout, no action, no code fetched at run time.
+  draft:
+    name: draft
+    needs: [plan, attest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # delete older drafts, create this one
+      actions: read # download this run's artifacts
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      # Again, in the one job that deletes: `needs` makes it unreachable from
+      # another ref today, and this keeps that true if the graph ever changes.
+      - name: Refuse any ref but main
+        run: |
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] \
+            || { echo "::error::Release runs only on refs/heads/main, not $GITHUB_REF."; exit 1; }
+
+      - name: Download this run's assets, bundle and notes
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --dir downloaded
+          mkdir -p staged
+          find downloaded/dist-* -type f -exec mv -n {} staged/ \;
+          mv -n downloaded/attested/SHA256SUMS downloaded/attested/SHA256SUMS.sigstore.json staged/
+          mv downloaded/notes/NOTES.md NOTES.md
+          ls -la staged
+
+      # What is uploaded must be exactly what was attested: every asset listed
+      # in SHA256SUMS, matching it, and nothing else.
+      - name: Check the assets against the attested SHA256SUMS
+        working-directory: staged
+        run: |
+          set -euo pipefail
+          sha256sum --strict -c SHA256SUMS
+          diff <(awk '{print $2}' SHA256SUMS | sort) \
+               <(ls | grep -vxF -e SHA256SUMS -e SHA256SUMS.sigstore.json | sort)
+
+      - name: Delete older drafts, so only one candidate exists
+        run: |
+          set -euo pipefail
+          for id in $(gh api "repos/$GH_REPO/releases" --paginate --jq '.[] | select(.draft) | .id'); do
+            echo "deleting draft $id"
+            gh api -X DELETE "repos/$GH_REPO/releases/$id"
+          done
+
+      # A DRAFT whose tag targets the built commit and does not exist yet.
+      # Publishing it creates the tag; that is the owner's click (ADR-0031).
+      - name: Create the draft
+        run: |
+          set -euo pipefail
+          # Checked again here, not only in `plan`: a tag created during the
+          # build would otherwise get this draft attached to it, and a token
+          # can publish a draft whose tag already exists (ADR-0031, What the
+          # spikes found). So no draft is ever created against an existing tag.
+          # Only a 404 counts as absent; any other failure stops the run too.
+          if probe="$(gh api "repos/$GH_REPO/git/ref/tags/v$VERSION" 2>&1)"; then
+            echo "::error::tag v$VERSION already exists; refusing to create a draft against it. Investigate the tag."
+            exit 1
+          elif ! grep -q 'HTTP 404' <<<"$probe"; then
+            echo "::error::could not tell whether tag v$VERSION exists: $probe"
+            exit 1
+          fi
           gh release create "v$VERSION" \
-            --repo "$GITHUB_REPOSITORY" \
             --draft \
             --target "$GITHUB_SHA" \
-            --title "hello-sandbox v$VERSION" \
-            --notes "Test fixture. Built from $GITHUB_REF at $GITHUB_SHA by run $GITHUB_RUN_ID. Attestation: ${{ steps.attest.outputs.attestation-url }}" \
+            --title "stand-in v$VERSION" \
+            --notes-file NOTES.md \
             staged/*
-          echo "built commit: $GITHUB_SHA ref: $GITHUB_REF"
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" >/dev/null 2>&1; then
-            echo "UNEXPECTED: tag v$VERSION exists" >&2; exit 1
+          if gh api "repos/$GH_REPO/git/ref/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag v$VERSION exists; a draft must not create its tag"
+            exit 1
           fi
-          echo "tag v$VERSION does not exist yet, as intended"
+          echo "drafted v$VERSION at $GITHUB_SHA; review it under Releases, then Publish."

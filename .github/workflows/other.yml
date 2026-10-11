@@ -1,0 +1,63 @@
+name: Other
+
+# Test harness, not part of the release design: a SECOND workflow in this
+# repository that builds the same stand-in, checksums it, attests SHA256SUMS
+# with this workflow's own OIDC identity, and leaves a draft carrying the same
+# asset names a real release has. A follower must refuse it: its policy pins the
+# signer workflow to release.yml@refs/heads/main.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "x.y.z to stamp and draft as v<x.y.z>"
+        required: true
+
+permissions: {}
+
+jobs:
+  other:
+    runs-on: macos-latest
+    permissions:
+      contents: write # create the draft
+      id-token: write # Sigstore keyless signing
+      attestations: write # persist the attestation
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Stamp, build, stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version"; exit 1; }
+          perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' Cargo.toml
+          perl -0pi -e 's/(\nname = "faber"\nversion = ")[^"]*"/$1$ENV{VERSION}"/' Cargo.lock
+          cargo build --locked --release --target aarch64-apple-darwin
+          mkdir -p staged "$RUNNER_TEMP/app/standin-app"
+          cp target/aarch64-apple-darwin/release/faber staged/faber-aarch64-apple-darwin
+          printf '%s\n' "$VERSION" > "$RUNNER_TEMP/app/standin-app/VERSION"
+          tar -czf staged/faber-app-aarch64-apple-darwin.tar.gz -C "$RUNNER_TEMP/app" standin-app
+          staged/faber-aarch64-apple-darwin --version
+          ( cd staged && shasum -a 256 faber-* > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Attest SHA256SUMS
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: staged/SHA256SUMS
+
+      - name: Create the draft
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE" staged/SHA256SUMS.sigstore.json
+          gh release create "v$VERSION" --draft --target "$GITHUB_SHA" \
+            --title "other-workflow v$VERSION" \
+            --notes "Test fixture: attested by other.yml, not release.yml. A follower must refuse it." \
+            staged/*

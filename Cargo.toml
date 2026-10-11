@@ -1,8 +1,11 @@
 [package]
-name = "hello-sandbox"
-# Placeholder. The release workflow stamps the real version into its own
-# checkout; nothing is committed back.
-version = "0.0.0"
+# A STAND-IN, not faber. It answers only what a follower's updater asks of a
+# staged binary (`--version`, `check-config`), so release-flow tests can run
+# end to end without shipping the real program.
+name = "faber"
+# The floor the release workflow bumps from; it stamps the real version into its
+# own checkout and commits nothing back.
+version = "1.0.0"
 edition = "2021"
 publish = false
 
